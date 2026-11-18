@@ -1,0 +1,319 @@
+import { expect, test, describe, vi, assertType } from 'vitest';
+import { Pool as PgPool, type QueryResult } from 'pg';
+import * as subtls from 'subtls';
+import { sampleQueries } from './sampleQueries';
+import { ISRGX1Cert } from './subtlsCert';
+import packageMetadata from '../../package.json';
+import {
+  neon,
+  neonConfig,
+  Pool as WsPool,
+  Client as WsClient,
+  SqlTemplate,
+  parseIntoClientConfig,
+} from '@neondatabase/serverless'; // see package.json: this points to 'file:.'
+
+function recursiveTransform(x: any, transform: (x: any) => any): any {
+  if (Array.isArray(x)) {
+    return x.map((item) => recursiveTransform(item, transform));
+  } else if (x !== null && typeof x === 'object') {
+    return Object.fromEntries(
+      Object.entries(x).map(([k, v]) => [k, recursiveTransform(v, transform)]),
+    );
+  } else {
+    return transform(x);
+  }
+}
+
+function functionsToPlaceholders(x: any) {
+  return recursiveTransform(x, (x) =>
+    typeof x === 'function' ? `__fn_arity_${x.length}__` : x,
+  );
+}
+
+const DB_DIRECT_URL = process.env.VITE_NEON_DB_URL!;
+const DB_POOLER_URL = process.env.VITE_NEON_DB_POOLER_URL!;
+
+const pgPool = new PgPool({ connectionString: DB_DIRECT_URL });
+
+test('uses the package URL as the default application name', () => {
+  const expected = `pkg:npm/%40neondatabase/serverless@${packageMetadata.version}`;
+
+  const defaultClient = new WsClient('postgres://user@example.com/database');
+  expect(defaultClient.getStartupConf().application_name).toBe(expected);
+
+  const namedClient = new WsClient({
+    connectionString: 'postgres://user@example.com/database',
+    application_name: 'custom-client',
+  });
+  expect(namedClient.getStartupConf().application_name).toBe('custom-client');
+});
+
+describe.each([
+  {
+    DB_URL: DB_DIRECT_URL,
+    wsPool: new WsPool({ connectionString: DB_DIRECT_URL }),
+  },
+  {
+    DB_URL: DB_POOLER_URL,
+    wsPool: new WsPool({ connectionString: DB_POOLER_URL }),
+  },
+])('WebSocket connections and queries', ({ DB_URL, wsPool }) => {
+  test(
+    'WebSockets query results match pg/TCP query results, using pool.connect()',
+    { timeout: 60000 },
+    async () => {
+      const wsClient = await wsPool.connect();
+      const pgClient = await pgPool.connect();
+      const sql = neon('postgresql://dummy:dummy@dummy.dummy/dummy'); // the URL is not actually used
+
+      for (const queryPromise of sampleQueries(sql)) {
+        const { query, params } =
+          queryPromise.queryData instanceof SqlTemplate
+            ? queryPromise.queryData.toParameterizedQuery()
+            : queryPromise.queryData;
+
+        const [wsResult, pgResult] = await Promise.all([
+          wsClient.query(query, params),
+          pgClient.query(query, params),
+        ]);
+
+        // unprocessed results don't strictly match because functions are minified by ws driver
+        expect(functionsToPlaceholders(wsResult)).toStrictEqual(
+          functionsToPlaceholders(pgResult),
+        );
+      }
+
+      wsClient.release();
+      pgClient.release();
+    },
+  );
+
+  test('pool.query() over WebSockets', async () => {
+    const wsResult = await wsPool.query('SELECT $1::int AS one', [1]);
+    assertType<QueryResult<any>>(wsResult);
+    expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+    expect((wsResult as any).viaNeonFetch).toBeUndefined();
+  });
+
+  test('pool.query() with poolQueryViaFetch', async () => {
+    try {
+      neonConfig.poolQueryViaFetch = true;
+      const wsResult = await wsPool.query('SELECT $1::int AS one', [1]);
+      assertType<QueryResult<any>>(wsResult);
+      expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+      expect((wsResult as any).viaNeonFetch).toBe(true);
+    } finally {
+      neonConfig.poolQueryViaFetch = false;
+    }
+  });
+
+  test('pool.query() with poolQueryViaFetch but also a listener that prevents fetch', async () => {
+    neonConfig.poolQueryViaFetch = true;
+
+    // use a new Pool because we know it will have to connect a new client
+    const customPool = new WsPool({ connectionString: DB_URL });
+
+    try {
+      const fn = vi.fn();
+      const connectListener = () => {
+        customPool.removeListener('connect', connectListener);
+        fn();
+      };
+      customPool.addListener('connect', connectListener);
+
+      const wsResult = await customPool.query('SELECT $1::int AS one', [1]);
+      assertType<QueryResult<any>>(wsResult);
+      expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+      expect(wsResult).not.toHaveProperty('viaNeonFetch');
+      expect(fn).toHaveBeenCalledOnce();
+    } finally {
+      neonConfig.poolQueryViaFetch = false;
+      await customPool.end();
+    }
+  });
+
+  test('client.query()', async () => {
+    const client = new WsClient(DB_URL);
+    await client.connect();
+    const wsResult = await client.query('SELECT $1::int AS one', [1]);
+    assertType<QueryResult<any>>(wsResult);
+    await client.end();
+    expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+    expect((wsResult as any).viaNeonFetch).toBeUndefined();
+  });
+
+  test('client.query() with pipelined connect (yes, no) x coalesced writes (yes, no)', async () => {
+    const { pipelineConnect, coalesceWrites } = neonConfig;
+    try {
+      for (const pc of ['password', false] as const) {
+        for (const cw of [true, false]) {
+          neonConfig.pipelineConnect = pc;
+          neonConfig.coalesceWrites = cw;
+
+          const client = new WsClient(DB_URL);
+          await client.connect();
+          const wsResult = await wsPool.query('SELECT $1::int AS one', [1]);
+          assertType<QueryResult<any>>(wsResult);
+          await client.end();
+
+          expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+          expect((wsResult as any).viaNeonFetch).toBeUndefined();
+        }
+      }
+    } finally {
+      neonConfig.pipelineConnect = pipelineConnect;
+      neonConfig.coalesceWrites = coalesceWrites;
+    }
+  });
+
+  test('client.query() using sync password function with pipelined connect (yes, no) x coalesced writes (yes, no)', async () => {
+    const { pipelineConnect, coalesceWrites } = neonConfig;
+    try {
+      for (const pc of ['password', false] as const) {
+        for (const cw of [true, false]) {
+          neonConfig.pipelineConnect = pc;
+          neonConfig.coalesceWrites = cw;
+
+          const connParams = parseIntoClientConfig(DB_URL);
+          const { password } = connParams;
+          delete connParams.password;
+          const syncPasswordFn = () => password as string;
+
+          const client = new WsClient({
+            ...connParams,
+            password: syncPasswordFn,
+          });
+          await client.connect();
+          const wsResult = await wsPool.query('SELECT $1::int AS one', [1]);
+          assertType<QueryResult<any>>(wsResult);
+          await client.end();
+
+          expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+          expect((wsResult as any).viaNeonFetch).toBeUndefined();
+        }
+      }
+    } finally {
+      neonConfig.pipelineConnect = pipelineConnect;
+      neonConfig.coalesceWrites = coalesceWrites;
+    }
+  });
+
+  test('pool.query() using async password function with pipelined connect (yes, no) x coalesced writes (yes, no)', async () => {
+    const { pipelineConnect, coalesceWrites } = neonConfig;
+    try {
+      for (const pc of ['password', false] as const) {
+        for (const cw of [true, false]) {
+          neonConfig.pipelineConnect = pc;
+          neonConfig.coalesceWrites = cw;
+
+          const connParams = parseIntoClientConfig(DB_URL);
+          const { password } = connParams;
+          delete connParams.password;
+          const asyncPasswordFn: () => Promise<string> = () =>
+            new Promise((resolve) =>
+              setTimeout(() => resolve(password as string), 500),
+            );
+
+          const pool = new WsPool({
+            ...connParams,
+            password: asyncPasswordFn,
+          });
+          const wsResult = await pool.query('SELECT $1::int AS one', [1]);
+          assertType<QueryResult<any>>(wsResult);
+          await pool.end();
+
+          expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+          expect((wsResult as any).viaNeonFetch).toBeUndefined();
+        }
+      }
+    } finally {
+      neonConfig.pipelineConnect = pipelineConnect;
+      neonConfig.coalesceWrites = coalesceWrites;
+    }
+  });
+
+  test('pool.query() using password function that throws with pipelined connect (yes, no)', async () => {
+    const { pipelineConnect } = neonConfig;
+    try {
+      for (const pc of ['password', false] as const) {
+        neonConfig.pipelineConnect = pc;
+
+        const connParams = parseIntoClientConfig(DB_URL);
+        delete connParams.password;
+        const asyncThrowingFn: () => Promise<string> = () =>
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Yikes')), 500),
+          );
+
+        const pool = new WsPool({
+          ...connParams,
+          password: asyncThrowingFn,
+        });
+        const wsResult = pool.query('SELECT $1::int AS one', [1]);
+        await expect(wsResult).rejects.toThrow('Yikes');
+      }
+    } finally {
+      neonConfig.pipelineConnect = pipelineConnect;
+    }
+  });
+
+  if (
+    typeof process !== 'undefined' &&
+    process.versions !== undefined &&
+    parseInt(process.versions.node) >= 19
+  ) {
+    // subtls test requires SCRAM auth, which requires `crytpo.subtle`, available from Node 19 onwards
+    test('client.query() with custom WebSocket proxy and subtls', async () => {
+      const client = new WsClient(DB_URL);
+      client.neonConfig.wsProxy = process.env.VITE_WSPROXY!;
+      client.neonConfig.forceDisablePgSSL = false;
+      client.neonConfig.pipelineConnect = false;
+      client.neonConfig.subtls = subtls;
+      client.neonConfig.rootCerts = ISRGX1Cert;
+
+      await client.connect();
+      const wsResult = await wsPool.query('SELECT $1::int AS one', [1]);
+      assertType<QueryResult<any>>(wsResult);
+      await client.end();
+      expect(wsResult.rows).toStrictEqual([{ one: 1 }]);
+      expect((wsResult as any).viaNeonFetch).toBeUndefined();
+    });
+  }
+});
+
+for (const releaseValue of [new Error('connection dropped'), undefined]) {
+  test(`Pool keeps serving queued queries after connection drops (issue #230), release with ${releaseValue}`, async () => {
+    const wsPool = new WsPool({ connectionString: DB_POOLER_URL, max: 1 });
+
+    // use `ws` for its `terminate` method
+    const { webSocketConstructor } = neonConfig;
+    neonConfig.webSocketConstructor = (await import('ws')).WebSocket;
+
+    try {
+      const client = await wsPool.connect();
+      client.on('error', () => {});
+
+      const slow = client.query('SELECT pg_sleep(10)');
+      const queued = wsPool.query('SELECT 1 AS one'); // waits for the only pool slot
+      await new Promise((r) => setTimeout(r, 250));
+
+      /* @ts-expect-error */
+      client.connection.stream.ws.terminate(); // simulate a dropped connection (no close frame)
+      await expect(slow).rejects.toThrow('Connection terminated unexpectedly');
+      client.release(releaseValue);
+
+      const result = await Promise.race<string>([
+        queued.then(() => 'queued query served'),
+        new Promise((r) => setTimeout(() => r('queued query waiting'), 5000)),
+      ]);
+
+      expect(result).toEqual('queued query served');
+    } finally {
+      // restore native/previous WebSocket
+      neonConfig.webSocketConstructor = webSocketConstructor;
+
+      await wsPool.end();
+    }
+  });
+}

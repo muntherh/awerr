@@ -1,0 +1,32 @@
+{
+  "mainEntryPointFilePath": "build/types/index.d.ts",
+  "newlineKind": "lf",
+  "enumMemberOrder": "preserve",
+  "bundledPackages": ["subtls", "pg", "events"],
+  "dtsRollup": {
+    "enabled": true,
+    "untrimmedFilePath": "build/generated.d.ts"
+  },
+  "apiReport": {
+    "enabled": false
+  },
+  "docModel": {
+    "enabled": false
+  },
+  "tsdocMetadata": {
+    "enabled": false
+  },
+  "messages": {
+    "extractorMessageReporting": {
+      "ae-wrong-input-file-type": {
+        "logLevel": "none"
+      },
+      "ae-missing-release-tag": {
+        "logLevel": "none"
+      },
+      "ae-forgotten-export": {
+        "logLevel": "none"
+      }
+    }
+  }
+}

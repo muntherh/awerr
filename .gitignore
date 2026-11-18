@@ -1,0 +1,12 @@
+.DS_Store
+.wrangler
+
+.env.*
+!.env.template
+
+node_modules
+build
+/.idea
+# database credentials (never commit)
+.env
+!.env.example

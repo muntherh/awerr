@@ -1,0 +1,19 @@
+// for tests
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["pg_catalog"]
+}
+
+generator client {
+  provider = "prisma-client"
+  output   = "./client"
+  previewFeatures = ["views"]
+}
+
+view pg_timezone_names {
+  @@schema("pg_catalog")
+  name	    String    @unique
+  abbrev	  String
+  is_dst	  Boolean
+}
